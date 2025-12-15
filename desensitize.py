@@ -2,33 +2,45 @@ import os
 import re
 import json
 import time
-import requests
 import concurrent.futures
 from multiprocessing import Pool, cpu_count
 from typing import Dict, List, Set, Any, Tuple
-import requests.exceptions
+
+# === 修改点 1: 引入 OpenAI SDK (DeepSeek 兼容) ===
+from openai import OpenAI
 
 # ================= 配置区域 =================
 
-API_KEY = "b8f0d3baad112a07ffff399c6e14f6e6.9vtIdrPqiWiJIkJX" 
-API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-MODEL_NAME = "glm-4.5-flash"
+# === 修改点 2: 配置 DeepSeek ===
+# 这里填入你的 Key
 
-# 目标仓库路径
-TARGET_DIR = "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-aipnlp/INS/ruanjunhao04/fuck/bd3lms"
+
+# DeepSeek 的 Base URL
+BASE_URL = "https://api.deepseek.com"
+
+# 模型名称
+MODEL_NAME = "deepseek-chat"
+
+# 目标仓库路径 (保持不变)
+TARGET_DIR = r"C:\Users\lenovo\Downloads\mtr\mtr"
 
 # 输出的配置文件名
 CONFIG_OUTPUT_FILE = "token_config.json"
 
-# 这些配置现在会被写入 JSON，指导回填脚本如何工作
+# 每个 Key 允许的并发线程数。
+# DeepSeek 并发通常还可以，只有1个Key的情况下，为了提高速度建议设为 5-10，
+# 但要注意不要触发 Rate Limit (429错误)
+THREADS_PER_KEY = 5 
+# 总并发数自动计算
+TOTAL_MAX_WORKERS = len(API_KEYS) * THREADS_PER_KEY
+
 ALLOWED_EXTS = {'.py', '.sh', '.yaml', '.yml', '.json', '.md', '.txt', '.conf', '.ini', '.xml', '.properties'}
 IGNORE_DIRS = {'.git', '__pycache__', 'node_modules', 'venv', '.idea', '.vscode', 'dist', 'build', 'target'}
 
 SENSITIVE_KEYWORDS = ["rangehow"]
-safe_max_workers = 1 
 
-REGEX_UNIX_STR = r'(?:"|\')(/[\w\-\.]+(?:/[\w\-\.]+)+)(?:"|\')'
-REGEX_WIN_STR = r'(?:"|\')([a-zA-Z]:\\[\w\-\.]+(?:\\[\w\-\.]+)+)(?:"|\')'
+REGEX_UNIX_STR = r'(?:["\']|\s|^)(/[\w\-\.]+(?:/[\w\-\.]+)+)(?:["\']|\s|$)'
+REGEX_WIN_STR = r'(?:["\']|\s|^)([a-zA-Z]:\\[\w\-\.]+(?:\\[\w\-\.]+)+)(?:["\']|\s|$)'
 
 # ===========================================
 
@@ -71,9 +83,7 @@ def scan_file_content(filepath) -> Dict[str, Dict[str, Any]]:
                 context_snippet = "".join(lines[start:end]).strip()
                 
                 for item in found_items:
-                    # 标记上下文
                     marked_context = context_snippet.replace(item, f"[[ {item} ]]")
-                    
                     if item not in local_results:
                         local_results[item] = {
                             "contexts": {marked_context}, 
@@ -113,7 +123,7 @@ def find_sensitive_items_parallel(root_dir) -> Dict[str, Dict[str, Any]]:
     if total_files == 0: return {}
 
     num_processes = min(cpu_count(), 8)
-    chunk_size = (total_files // num_processes) + 1
+    chunk_size = (total_files // num_processes) + 1 if total_files > 0 else 1
     chunks = [target_files[i:i + chunk_size] for i in range(0, total_files, chunk_size)]
 
     final_results = {}
@@ -132,17 +142,19 @@ def find_sensitive_items_parallel(root_dir) -> Dict[str, Dict[str, Any]]:
     print(f"[*] 扫描结束。共发现 {len(final_results)} 个唯一的敏感项。")
     return final_results
 
-def call_llm_for_placeholder(original_item: str, item_contexts_str: str) -> Tuple[str, str]:
+# ================= LLM 处理核心 (修改为 OpenAI/DeepSeek 版) =================
+
+def call_llm_for_placeholder(original_item: str, item_contexts_str: str, assigned_api_key: str) -> Tuple[str, str]:
     """
-    请求 LLM 生成占位符和描述。
-    返回: (placeholder, description)
+    使用 OpenAI SDK 调用 DeepSeek API。
     """
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {API_KEY}"
-    }
+    # === 修改点 3: 初始化 OpenAI 客户端 ===
+    client = OpenAI(
+        api_key=assigned_api_key,
+        base_url=BASE_URL
+    )
     
-    # 强制要求 JSON 格式输出
+    # DeepSeek 的 JSON 模式要求 Prompt 中必须包含 "json" 字样
     prompt = f"""
     Code Desensitization Task.
 
@@ -154,99 +166,120 @@ def call_llm_for_placeholder(original_item: str, item_contexts_str: str) -> Tupl
     ```
     
     Instructions:
-    1. Identify the semantic meaning of the Target String (e.g., dataset path, checkpoint dir, username, output dir).
+    1. Identify the semantic meaning of the Target String (e.g. path, secret, ip).
     2. Create a UNIQUE, UPPERCASE_SNAKE_CASE placeholder wrapped in < > (e.g., <SAR8_DATASET_ROOT>).
-    3. Write a short, natural language description explaining what this path represents so a new user knows what to fill in.
+    3. Write a short description.
     
     Output Format: JSON ONLY.
     {{
         "placeholder": "<YOUR_PLACEHOLDER>",
-        "description": "Short explanation of what this path is."
+        "description": "Short explanation."
     }}
     """
     
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": "You are a code assistant. You ONLY respond with valid JSON."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.1
-    }
-
     max_retries = 5
+    last_exception = None
+
     for attempt in range(max_retries):
         try:
-            response = requests.post(API_URL, headers=headers, json=payload, timeout=20)
-            if response.status_code == 200:
-                res_json = response.json()
-                content = res_json['choices'][0]['message']['content'].strip()
+            # === 修改点 4: 使用 OpenAI 风格发起请求 ===
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": "You are a code assistant. You ONLY respond with valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={'type': 'json_object'},  # 强制 JSON 模式
+                temperature=0.1,
+                timeout=30  # 设置超时
+            )
+            
+            # === 修改点 5: 响应解析 ===
+            content = response.choices[0].message.content
+            
+            # 虽然开了 JSON mode，但为了保险起见，还是做一下清洗（去掉可能的 Markdown 标记）
+            if content.startswith("```"):
+                content = content.replace("```json", "").replace("```", "")
+            content = content.strip()
+            
+            try:
+                data = json.loads(content)
+                placeholder = data.get("placeholder")
+                description = data.get("description", "No description provided.")
                 
-                # 清洗 Markdown 代码块标记
-                content = content.replace("```json", "").replace("```", "").strip()
+                if not placeholder:
+                    raise ValueError("JSON parsed but 'placeholder' is empty.")
                 
-                try:
-                    data = json.loads(content)
-                    placeholder = data.get("placeholder", "<UNKNOWN_PLACEHOLDER>")
-                    description = data.get("description", "No description provided.")
-                    
-                    # 再次清洗占位符格式
-                    if not placeholder.startswith("<"): placeholder = f"<{placeholder}"
-                    if not placeholder.endswith(">"): placeholder = f"{placeholder}>"
-                    
-                    return placeholder, description
-                except json.JSONDecodeError:
-                    # 如果解析失败，简单兜底
-                    clean_content = re.sub(r'[^A-Z0-9_]', '', content.upper())
-                    return f"<{clean_content}>", "Complex string, check code context."
+                # 格式规范化
+                if not placeholder.startswith("<"): placeholder = f"<{placeholder}"
+                if not placeholder.endswith(">"): placeholder = f"{placeholder}>"
+                
+                return placeholder, description
 
-            elif response.status_code == 429:
-                sleep_time = 2 * (2 ** attempt)
-                time.sleep(sleep_time)
-                continue
-            else:
-                raise Exception(f"API Error: {response.status_code}")
+            except json.JSONDecodeError:
+                raise ValueError(f"Invalid JSON response: {content[:50]}...")
 
         except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep(2)
+            last_exception = e
+            key_hint = assigned_api_key[-4:]
+            print(f"[Warn] Item '{original_item[:15]}...' failed on Key(...{key_hint}) Attempt {attempt+1}: {e}")
+            
+            # 简单的退避策略
+            error_str = str(e)
+            if "429" in error_str: # Rate Limit
+                time.sleep(3 * (attempt + 1))
             else:
-                return f"<UNKNOWN_{int(time.time())}>", "Generation failed."
+                time.sleep(2)
     
-    return f"<UNKNOWN_{int(time.time())}>", "Generation failed."
+    # 如果重试完还是失败，抛出错误
+    raise RuntimeError(f"ALL RETRIES FAILED for item '{original_item}'. Last error: {last_exception}")
 
 def generate_mappings_and_config(sensitive_data: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, str], Dict[str, Any]]:
     """
-    生成映射关系，并构建详细的配置信息
+    并发请求 LLM，如果有任何一个任务失败，主进程立刻报错退出。
     """
-    mapping = {} # 原文 -> 占位符 (用于代码替换)
-    config_data = {} # 占位符 -> {描述, 用户填写的字段}
-    
+    mapping = {} 
+    config_data = {} 
     used_placeholders = set() 
 
+    # 准备任务列表
     llm_tasks = []
     for item, data in sensitive_data.items():
-        unique_contexts = sorted(list(data["contexts"]))[:2] # 上下文只取2条
+        unique_contexts = sorted(list(data["contexts"]))[:2]
         joined_context = "\n...SNIP...\n".join(unique_contexts)
         llm_tasks.append((item, joined_context))
     
-    print(f"[*] 请求大模型生成语义信息 (并发数: {safe_max_workers})...")
+    num_tasks = len(llm_tasks)
+    num_keys = len(API_KEYS)
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=safe_max_workers) as executor:
-        future_to_item = {
-            executor.submit(call_llm_for_placeholder, item, context): item 
-            for item, context in llm_tasks
-        }
-        
-        processed = 0
-        total = len(sensitive_data)
-        
-        for future in concurrent.futures.as_completed(future_to_item):
-            original_item = future_to_item[future]
-            try:
-                placeholder, description = future.result()
+    print(f"[*] 准备处理 {num_tasks} 个敏感项。")
+    print(f"[*] 可用 Key 数量: {num_keys}，总并发线程数: {TOTAL_MAX_WORKERS}")
+    
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=TOTAL_MAX_WORKERS) as executor:
+            future_to_item = {}
+            
+            for i, (item, context) in enumerate(llm_tasks):
+                selected_key = API_KEYS[i % num_keys]
+                future = executor.submit(call_llm_for_placeholder, item, context, selected_key)
+                future_to_item[future] = item
+            
+            print(f"[*] 已提交所有任务，正在执行...")
+            
+            processed = 0
+            for future in concurrent.futures.as_completed(future_to_item):
+                original_item = future_to_item[future]
                 
-                # 防撞逻辑
+                try:
+                    placeholder, description = future.result()
+                except Exception as e:
+                    print(f"\n[!!!] 致命错误：处理 '{original_item}' 失败。")
+                    print(f"[!!!] 原因: {e}")
+                    print("[!!!] 正在终止所有任务...")
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise e
+
+                # 后续处理成功逻辑
                 base_placeholder = placeholder
                 counter = 2
                 while placeholder in used_placeholders:
@@ -254,23 +287,20 @@ def generate_mappings_and_config(sensitive_data: Dict[str, Dict[str, Any]]) -> T
                     counter += 1
                 
                 used_placeholders.add(placeholder)
-                
-                # 存入替换映射
                 mapping[original_item] = placeholder
                 
-                # 存入配置文件结构
-                # 注意：这里我们以占位符为Key，方便用户填写
                 config_data[placeholder] = {
                     "description": description,
-                    "target_value": "",  # 用户之后要填这个
+                    "target_value": "",  
                 }
                 
                 processed += 1
                 if processed % 5 == 0:
-                    print(f"    [{processed}/{total}] item processed.")
-            
-            except Exception as e:
-                print(f"Error processing {original_item}: {e}")
+                    print(f"    [{processed}/{num_tasks}] processed ok.")
+
+    except Exception as fatal_error:
+        print("\n[FAILED] 程序因错误而中断。未生成配置文件，未修改文件。")
+        raise fatal_error
 
     return mapping, config_data
 
@@ -306,20 +336,15 @@ def apply_replacements(root_dir, mapping: Dict[str, str]):
     print(f"[*] 替换完成，共修改了 {count} 个文件。")
 
 def save_config_file(config_data: Dict[str, Any]):
-    """
-    保存用户配置文件，包含元数据(Meta)和Token数据
-    """
-    # 构造最终的 JSON 结构
     final_output = {
         "meta": {
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "allowed_extensions": list(ALLOWED_EXTS), # 转为 list 以便 JSON 序列化
+            "allowed_extensions": list(ALLOWED_EXTS),
             "ignore_dirs": list(IGNORE_DIRS)
         },
         "tokens": {}
     }
 
-    # 对 Token 按字母排序
     sorted_keys = sorted(config_data.keys())
     for k in sorted_keys:
         final_output["tokens"][k] = config_data[k]
@@ -329,7 +354,7 @@ def save_config_file(config_data: Dict[str, Any]):
         json.dump(final_output, f, indent=4, ensure_ascii=False)
         
     print(f"\n[SUCCESS] 汇总配置文件已生成: {output_path}")
-    print(f"[*] 已将扫描策略（{len(ALLOWED_EXTS)}种后缀, {len(IGNORE_DIRS)}个忽略目录）写入配置文件。")
+
 if __name__ == "__main__":
     if not os.path.exists(TARGET_DIR):
         print(f"错误：目录 {TARGET_DIR} 不存在")
@@ -338,10 +363,10 @@ if __name__ == "__main__":
         sensitive_data = find_sensitive_items_parallel(TARGET_DIR)
         
         if sensitive_data:
-            # 2. 生成映射和配置
+            # 2. 生成映射和配置 (出错会直接 Crash)
             mapping, config_data = generate_mappings_and_config(sensitive_data)
             
-            # 3. 替换代码
+            # 3. 替换代码 (只有上面成功了才会执行到这里)
             apply_replacements(TARGET_DIR, mapping)
             
             # 4. 生成汇总文件
